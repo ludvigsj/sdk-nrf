@@ -83,6 +83,9 @@ Bluetooth mesh
 * Updated:
 
   * :ref:`bt_mesh_dm_srv_readme` and :ref:`bt_mesh_dm_cli_readme` model IDs and opcodes have been updated to avoid conflict with Simple OnOff Server and Client models.
+  * :ref:`bt_mesh_sensors_readme` now use an updated API using :c:struct:`bt_mesh_sensor_value` instead of :c:struct:`sensor_value` to represent sensor values.
+    This makes it possible to accurately represent all encodable sensor values.
+    The old APIs based on :c:struct:`sensor_value` are deprecated, but are still available for backward compatibility, and can be enabled by using :kconfig:option:`CONFIG_BT_MESH_SENSOR_USE_SENSOR_VALUE`.
 
 Matter
 ------
