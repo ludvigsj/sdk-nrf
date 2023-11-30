@@ -151,8 +151,157 @@ typedef struct bt_mesh_sensor_value sensor_value_type;
 		  (_value)->val2 <= (_end)->val2)))
 #else
 #define SENSOR_VALUE_IN_RANGE(_value, _start, _end) (                          \
-		(_value)->format->compare((_value), (_start)) >= 0 &&          \
-		(_value)->format->compare((_end), (_value)) >= 0)
+		(_value)->format->cb->compare((_value), (_start)) >= 0 &&      \
+		(_value)->format->cb->compare((_end), (_value)) >= 0)
+
+struct bt_mesh_sensor_format_cb {
+	/** @brief Perform a delta check between two @ref bt_mesh_sensor_value
+	 *         instances.
+	 *
+	 *  @c current and @c previous must have the same format.
+	 *
+	 *  @param[in] current  The current value.
+	 *  @param[in] previous The previous sensor value to compare against.
+	 *  @param[in] delta    The delta to use when checking.
+	 *
+	 *  @return @c true if the difference between @c current and @c previous
+	 *          is bigger than the relevant delta specified in @c delta, @c
+	 *          false otherwise.
+	 */
+	bool (*const delta_check)(const struct bt_mesh_sensor_value *current,
+				  const struct bt_mesh_sensor_value *previous,
+				  const struct bt_mesh_sensor_deltas *delta);
+
+	/** @brief Compare two @ref bt_mesh_sensor_value instances.
+	 *
+	 *  @c op1 and @c op1 must have the same format.
+	 *
+	 *  @param[in] op1 The first value to compare.
+	 *  @param[in] op2 The second value to compare.
+	 *
+	 *  @return 0 if @c op1 == @c op2, 1 if @c op1 > @c op2, -1 otherwise
+	 *          (including if @c op1 and @c op2 are not comparable).
+	 */
+	int (*const compare)(const struct bt_mesh_sensor_value *op1,
+			     const struct bt_mesh_sensor_value *op2);
+
+	/** @brief Convert a @ref bt_mesh_sensor_value instance to a
+	 *         @ref sensor_value.
+	 *
+	 *  If this function returns a status other than
+	 *  @c BT_MESH_SENSOR_VALUE_NUMBER, @c val is not modified.
+	 *
+	 *  @param[in]  sensor_val The @ref bt_mesh_sensor_value to convert.
+	 *  @param[out] val        The resulting @ref sensor_value.
+	 *
+	 *  @return The status of the conversion.
+	 */
+	enum bt_mesh_sensor_value_status (*const to_sensor_value)(
+		const struct bt_mesh_sensor_value *sensor_val,
+		struct sensor_value *val);
+
+	/** @brief Convert a @ref sensor_value instance to a
+	 *         @ref bt_mesh_sensor_value.
+	 *
+	 *  If @c val has a value that cannot be represented by the format,
+	 *  @c sensor_val will be set to the value clamped to the range
+	 *  supported by the format, and this function will return -ERANGE.
+	 *  This will clamp to "Greater than the maximum value" and
+	 *  "Less than the minimum value" if these are supported by the format.
+	 *
+	 *  If this function returns an error code other than -ERANGE,
+	 *  @c sensor_val is not modified.
+	 *
+	 *  @param[in]  format     Format to use when encoding the sensor value.
+	 *  @param[in]  val        The @ref sensor_value to convert.
+	 *  @param[out] sensor_val The resulting @ref bt_mesh_sensor_value.
+	 *
+	 *  @return 0 on success, (negative) error code otherwise.
+	 */
+	int (*const from_sensor_value)(
+		const struct bt_mesh_sensor_format *format,
+		const struct sensor_value *val,
+		struct bt_mesh_sensor_value *sensor_val);
+
+	/** @brief Convert a @ref bt_mesh_sensor_value to a @c float.
+	 *
+	 *  If this function returns a status for which
+	 *  @ref bt_mesh_sensor_value_status_is_numeric returns false, @c val
+	 *  is not modified.
+	 *
+	 *  @param[in]  sensor_val The @ref bt_mesh_sensor_value to convert.
+	 *  @param[out] val        The resulting @c float.
+	 *
+	 *  @return The status of the conversion.
+	 */
+	enum bt_mesh_sensor_value_status (*const to_float)(
+		const struct bt_mesh_sensor_value *sensor_val, float *val);
+
+	/** @brief Convert a @c float to a @ref bt_mesh_sensor_value.
+	 *
+	 *  If @c val has a value that cannot be represented by the format,
+	 *  @c sensor_val will be set to the value clamped to the range
+	 *  supported by the format, and this function will return -ERANGE.
+	 *  This will clamp to "Greater than the maximum value" and
+	 *  "Less than the minimum value" if these are supported by the format.
+	 *
+	 *  If this function returns an error code other than -ERANGE,
+	 *  @c sensor_val is not modified.
+	 *
+	 *  @param[in]  format     Format to use when encoding the sensor value.
+	 *  @param[in]  val        The @c float to convert.
+	 *  @param[out] sensor_val The resulting @ref bt_mesh_sensor_value.
+	 *
+	 *  @return 0 on success, (negative) error code otherwise.
+	 */
+	int (*const from_float)(const struct bt_mesh_sensor_format *format,
+				float val,
+				struct bt_mesh_sensor_value *sensor_val);
+
+	/** @brief Convert a @ref bt_mesh_sensor_value_status value to a
+	 *         @ref bt_mesh_sensor_value.
+	 *
+	 *  @param[in]  format     Format to use when encoding the sensor value.
+	 *  @param[in]  val        The @ref bt_mesh_sensor_value_special value
+	 *                         to convert.
+	 *  @param[out] sensor_val The resulting @ref bt_mesh_sensor_value on
+	 *                         success. Undefined otherwise.
+	 *
+	 *  @return 0 on success, (negative) error code otherwise.
+	 */
+	int (*const from_special)(const struct bt_mesh_sensor_format *format,
+				  enum bt_mesh_sensor_value_status val,
+				  struct bt_mesh_sensor_value *sensor_val);
+
+	/** @brief Get a human readable representation of a
+	 *         @ref bt_mesh_sensor_value.
+	 *
+	 *  @param[in]  sensor_val Sensor value to represent.
+	 *  @param[out] str        String buffer to fill. Should be
+	 *                         @ref BT_MESH_SENSOR_CH_STR_LEN bytes long.
+	 *  @param[in]  len        Length of @c str buffer.
+	 *
+	 *  @return 0 if string successfully written, (negative) error code
+	 *          otherwise.
+	 */
+	int (*const to_string)(const struct bt_mesh_sensor_value *sensor_val,
+			       char *str, size_t len);
+};
+
+/** Sensor channel value format. */
+struct bt_mesh_sensor_format {
+	/** Callbacks used for this format. */
+	struct bt_mesh_sensor_format_cb *cb;
+	/** User data pointer. Used internally by the sensor types. */
+	void *user_data;
+	/** Size of the encoded data in bytes. */
+	size_t size;
+
+#ifdef CONFIG_BT_MESH_SENSOR_LABELS
+	/** Pointer to the unit associated with this format. */
+	const struct bt_mesh_sensor_unit *unit;
+#endif
+};
 
 /** @brief Check if a value change breaks the delta threshold.
  *

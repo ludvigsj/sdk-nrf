@@ -51,12 +51,12 @@ sensor_cadence(const struct bt_mesh_sensor_threshold *threshold,
 	const struct bt_mesh_sensor_value *high, *low;
 	const struct bt_mesh_sensor_format *fmt = curr->format;
 
-	if (fmt->compare(&threshold->range.high,
-			 &threshold->range.low) >= 0) {
+	if (fmt->cb->compare(&threshold->range.high,
+			     &threshold->range.low) >= 0) {
 		low = &threshold->range.low;
 		high = &threshold->range.high;
-	} else if (fmt->compare(&threshold->range.low,
-				&threshold->range.high) >= 0) {
+	} else if (fmt->cb->compare(&threshold->range.low,
+				    &threshold->range.high) >= 0) {
 		low = &threshold->range.high;
 		high = &threshold->range.low;
 	} else {
@@ -118,8 +118,8 @@ bool bt_mesh_sensor_delta_threshold(const struct bt_mesh_sensor *sensor,
 bool bt_mesh_sensor_delta_threshold(const struct bt_mesh_sensor *sensor,
 				    const struct bt_mesh_sensor_value *curr)
 {
-	return curr->format->delta_check(curr, &sensor->state.prev,
-					 &sensor->state.threshold.deltas);
+	return curr->format->cb->delta_check(curr, &sensor->state.prev,
+					     &sensor->state.threshold.deltas);
 }
 #endif /* defined(CONFIG_BT_MESH_SENSOR_USE_SENSOR_VALUE) */
 
@@ -688,8 +688,8 @@ int sensor_cadence_decode(struct net_buf_simple *buf,
 		threshold->range.high = threshold->range.low;
 		threshold->range.low = temp;
 #else
-	if (threshold->range.high.format->compare(&threshold->range.low,
-						  &threshold->range.high) > 0) {
+	if (threshold->range.high.format->cb->compare(&threshold->range.low,
+						      &threshold->range.high) > 0) {
 		uint8_t temp[CONFIG_BT_MESH_SENSOR_CHANNEL_ENCODED_SIZE_MAX];
 
 		memcpy(temp, &threshold->range.high.raw,
@@ -756,9 +756,6 @@ void sensor_cadence_update(struct bt_mesh_sensor *sensor,
 
 #ifdef CONFIG_BT_MESH_SENSOR_USE_SENSOR_VALUE
 const char *bt_mesh_sensor_ch_str(const struct sensor_value *ch)
-#else
-const char *bt_mesh_sensor_ch_str(const struct bt_mesh_sensor_value *ch)
-#endif
 {
 	static char str[BT_MESH_SENSOR_CH_STR_LEN];
 
@@ -768,3 +765,121 @@ const char *bt_mesh_sensor_ch_str(const struct bt_mesh_sensor_value *ch)
 
 	return str;
 }
+#else
+const char *bt_mesh_sensor_ch_str(const struct bt_mesh_sensor_value *ch)
+{
+	static char str[BT_MESH_SENSOR_CH_STR_LEN];
+	enum bt_mesh_sensor_value_status status;
+	float float_val;
+
+	if (ch->format->cb->to_string) {
+		int err;
+
+		err = ch->format->cb->to_string(ch, str, BT_MESH_SENSOR_CH_STR_LEN);
+		if (err) {
+			strcpy(str, "<unprintable value>");
+		}
+		return str;
+	}
+
+	status = ch->format->cb->to_float(ch, &float_val);
+
+	switch (status) {
+	case BT_MESH_SENSOR_VALUE_NUMBER:
+		(void)snprintk(str, BT_MESH_SENSOR_CH_STR_LEN, "%g", float_val);
+		break;
+	case BT_MESH_SENSOR_VALUE_MAX_OR_GREATER:
+		(void)snprintk(str, BT_MESH_SENSOR_CH_STR_LEN, ">=%g",
+			       float_val);
+		break;
+	case BT_MESH_SENSOR_VALUE_MIN_OR_LESS:
+		(void)snprintk(str, BT_MESH_SENSOR_CH_STR_LEN, "<=%g",
+			       float_val);
+	case BT_MESH_SENSOR_VALUE_UNKNOWN:
+		strcpy(str, "<value is not known>");
+		break;
+	case BT_MESH_SENSOR_VALUE_INVALID:
+		strcpy(str, "<value is invalid>");
+		break;
+	case BT_MESH_SENSOR_VALUE_TOTAL_DEVICE_LIFE:
+		strcpy(str, "<total life of device>");
+		break;
+	default:
+		strcpy(str, "<unprintable value>");
+	}
+
+	return str;
+}
+
+int bt_mesh_sensor_value_compare(const struct bt_mesh_sensor_value *a,
+				 const struct bt_mesh_sensor_value *b)
+{
+	if (a->format == b->format) {
+		return a->format->cb->compare(a, b);
+	}
+
+	/* Fall back to comparing floats. */
+	float a_float, b_float;
+	enum bt_mesh_sensor_value_status status;
+
+	status = bt_mesh_sensor_value_to_float(a, &a_float);
+	if (!bt_mesh_sensor_value_status_is_numeric(status)) {
+		return 0;
+	}
+
+	status = bt_mesh_sensor_value_to_float(b, &b_float);
+	if (!bt_mesh_sensor_value_status_is_numeric(status)) {
+		return 0;
+	}
+
+	return a_float > b_float ? 1 : (a_float < b_float ? -1 : 0);
+}
+
+enum bt_mesh_sensor_value_status
+bt_mesh_sensor_value_to_float(const struct bt_mesh_sensor_value *sensor_val,
+			      float *val)
+{
+	return sensor_val->format->cb->to_float(sensor_val, val);
+}
+
+int bt_mesh_sensor_value_from_float(const struct bt_mesh_sensor_format *format,
+				    float val,
+				    struct bt_mesh_sensor_value *sensor_val)
+{
+	return format->cb->from_float(format, val, sensor_val);
+}
+
+enum bt_mesh_sensor_value_status
+bt_mesh_sensor_value_to_sensor_value(
+	const struct bt_mesh_sensor_value *sensor_val,
+	struct sensor_value *val)
+{
+	return sensor_val->format->cb->to_sensor_value(sensor_val, val);
+}
+
+int bt_mesh_sensor_value_from_sensor_value(
+	const struct bt_mesh_sensor_format *format,
+	const struct sensor_value *val,
+	struct bt_mesh_sensor_value *sensor_val)
+{
+	return format->cb->from_sensor_value(format, val, sensor_val);
+}
+
+enum bt_mesh_sensor_value_status
+bt_mesh_sensor_value_get_status(const struct bt_mesh_sensor_value *sensor_val)
+{
+	return sensor_val->format->cb->to_float(sensor_val, NULL);
+}
+
+int bt_mesh_sensor_value_from_special(
+	const struct bt_mesh_sensor_format *format,
+	enum bt_mesh_sensor_value_status val,
+	struct bt_mesh_sensor_value *sensor_val)
+{
+	if (val == BT_MESH_SENSOR_VALUE_NUMBER ||
+	    val == BT_MESH_SENSOR_VALUE_CONVERSION_ERROR) {
+		return -EINVAL;
+	}
+	return format->cb->from_special(format, val, sensor_val);
+}
+#endif /* defined(CONFIG_BT_MESH_USE_SENSOR_VALUE) */
