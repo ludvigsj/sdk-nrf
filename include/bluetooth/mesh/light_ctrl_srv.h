@@ -22,6 +22,7 @@
 #include <bluetooth/mesh/model_types.h>
 #include <bluetooth/mesh/light_ctrl_reg.h>
 #include <bluetooth/mesh/light_ctrl_reg_spec.h>
+#include <bluetooth/mesh/light_ctrl_sm.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -158,6 +159,8 @@ struct bt_mesh_light_ctrl_srv {
 		uint32_t initial_centilux;
 		/** Fade duration */
 		uint32_t duration;
+		/** Previous target onoff value */
+		bool prev_target_onoff;
 	} fade;
 	/** State timer */
 	struct k_work_delayable timer;
@@ -194,6 +197,8 @@ struct bt_mesh_light_ctrl_srv {
 	/** Previous regulator value */
 	uint16_t reg_prev;
 #endif /* CONFIG_BT_MESH_LIGHT_CTRL_SRV_REG */
+	/** Lightness control state machine instance */
+	struct bt_mesh_light_ctrl_sm sm;
 	/** Lightness server instance */
 	struct bt_mesh_lightness_srv *lightness;
 	/** Extended Generic OnOff server */
