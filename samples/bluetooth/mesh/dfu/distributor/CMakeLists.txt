@@ -18,6 +18,10 @@ target_sources(app PRIVATE ${app_sources}
   ${dfu_common_dir}/dfu_target.c
 )
 
+target_sources_ifdef(CONFIG_MEMFAULT_NCS_DEVICE_INFO_CUSTOM app PRIVATE
+  ${dfu_common_dir}/memfault_device_info.c
+)
+
 # Enable authentication with passkey
 if(CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_AUTHEN AND CONFIG_BT_MESH_LE_PAIR_RESP)
   target_sources(app PRIVATE ${ZEPHYR_NRF_MODULE_DIR}/samples/bluetooth/mesh/common/smp_bt_auth.c)

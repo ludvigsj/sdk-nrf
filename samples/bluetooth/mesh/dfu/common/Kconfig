@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Nordic Semiconductor ASA
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+
+config MESH_DFU_SAMPLE_MEMFAULT_FWID
+	bool "Use Memfault-oriented FWID format"
+	help
+	  Enables the Memfault-oriented FWID format with company ID, type byte (0xFF),
+	  and variable-length hardware version, software version, and software type strings.
+
+config MESH_DFU_SAMPLE_MEMFAULT_HW_VERSION
+	string "Hardware version string reported to Memfault and encoded in the FWID"
+	help
+	  Hardware version string embedded verbatim in the Memfault-oriented FWID.
+
+config MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE
+	string "Software type string reported to Memfault and encoded in the FWID"
+	default "cpuapp"
+	help
+	  Memfault software type string embedded verbatim in the Memfault-oriented FWID.

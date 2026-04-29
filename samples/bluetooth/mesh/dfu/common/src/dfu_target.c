@@ -20,10 +20,37 @@
 
 #include <zephyr/dfu/mcuboot.h>
 
+#include <string.h>
+
 static struct bt_mesh_blob_io_flash *blob_flash_stream;
 static enum bt_mesh_dfu_effect img_effect = BT_MESH_DFU_EFFECT_NONE;
 struct mcuboot_img_sem_ver img_ver;
 
+#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+#define FWID_COMPANY_ID_LEN 2U
+#define FWID_TYPE_LEN 1U
+#define FWID_HW_VERSION_LEN 1U
+#define FWID_SW_VERSION_LEN 1U
+#define FWID_SW_TYPE_LEN 1U
+#define FWID_PREFIX_LEN (FWID_COMPANY_ID_LEN + FWID_TYPE_LEN + FWID_HW_VERSION_LEN + \
+				 FWID_SW_VERSION_LEN + FWID_SW_TYPE_LEN)
+
+#define MEMFAULT_HW_VERSION_STR CONFIG_MESH_DFU_SAMPLE_MEMFAULT_HW_VERSION
+
+static uint8_t fwid[CONFIG_BT_MESH_DFU_FWID_MAXLEN];
+static char memfault_sw_version[sizeof("255.255.65535+4294967295")];
+static bool image_version_loaded;
+
+BUILD_ASSERT((sizeof(MEMFAULT_HW_VERSION_STR) - 1) <= UINT8_MAX,
+	     "Memfault HW version exceeds 255 bytes and cannot be encoded in FWID");
+BUILD_ASSERT((sizeof(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE) - 1) <= UINT8_MAX,
+	     "Memfault SW type exceeds 255 bytes and cannot be encoded in FWID");
+BUILD_ASSERT(FWID_PREFIX_LEN + (sizeof(MEMFAULT_HW_VERSION_STR) - 1) +
+		     (sizeof(memfault_sw_version) - 1) +
+		     (sizeof(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE) - 1) <=
+		     CONFIG_BT_MESH_DFU_FWID_MAXLEN,
+	     "FWID buffer is too small for full Memfault HW, SW versions, and SW type");
+#else
 static struct {
 	uint16_t company_id;
 	uint8_t major;
@@ -31,10 +58,16 @@ static struct {
 	uint16_t revision;
 	uint32_t build_num;
 } __packed fwid;
+#endif
 
 static struct bt_mesh_dfu_img dfu_imgs[] = { {
+	#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+	.fwid = fwid,
+	.fwid_len = 0,
+	#else
 	.fwid = &fwid,
 	.fwid_len = sizeof(fwid),
+	#endif
 } };
 
 #if defined(CONFIG_BT_MESH_DFU_METADATA)
@@ -249,7 +282,22 @@ struct bt_mesh_dfu_srv dfu_srv =
 static void image_version_load(void)
 {
 	struct mcuboot_img_header img_header;
+	#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+	const char *memfault_hw_version = MEMFAULT_HW_VERSION_STR;
+	const char *memfault_sw_type = CONFIG_MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE;
+	size_t hw_len;
+	size_t sw_len;
+	size_t sw_type_len;
+	size_t encoded_len;
+	int sw_version_len;
+	#endif
 	int err;
+
+	#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+	if (image_version_loaded) {
+		return;
+	}
+	#endif
 
 	err = boot_read_bank_header(FIXED_PARTITION_ID(slot0_partition), &img_header,
 				    sizeof(img_header));
@@ -260,6 +308,47 @@ static void image_version_load(void)
 
 	img_ver = img_header.h.v1.sem_ver;
 
+	#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+	sw_version_len = snprintk(memfault_sw_version, sizeof(memfault_sw_version), "%u.%u.%u+%u",
+				 img_ver.major, img_ver.minor, img_ver.revision,
+				 img_ver.build_num);
+	if ((sw_version_len < 0) || (sw_version_len >= sizeof(memfault_sw_version))) {
+		printk("FWID encoding failed due to software version formatting\n");
+		return;
+	}
+
+	hw_len = sizeof(MEMFAULT_HW_VERSION_STR) - 1;
+	sw_len = (size_t)sw_version_len;
+	sw_type_len = sizeof(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE) - 1;
+	encoded_len = FWID_PREFIX_LEN + hw_len + sw_len + sw_type_len;
+
+	if (encoded_len > sizeof(fwid)) {
+		printk("FWID encoding failed due to length constraints\n");
+		return;
+	}
+
+	struct net_buf_simple buf;
+
+	net_buf_simple_init_with_data(&buf, fwid, sizeof(fwid));
+	net_buf_simple_reset(&buf);
+
+	net_buf_simple_add_le16(&buf, CONFIG_BT_COMPANY_ID);
+	net_buf_simple_add_u8(&buf, 0xFF);
+	net_buf_simple_add_u8(&buf, (uint8_t)hw_len);
+	net_buf_simple_add_u8(&buf, (uint8_t)sw_len);
+	net_buf_simple_add_u8(&buf, (uint8_t)sw_type_len);
+	net_buf_simple_add_mem(&buf, memfault_hw_version, hw_len);
+	net_buf_simple_add_mem(&buf, memfault_sw_version, sw_len);
+	net_buf_simple_add_mem(&buf, memfault_sw_type, sw_type_len);
+
+	dfu_imgs[0].fwid_len = buf.len;
+
+	printk("Current image version: %s\n", memfault_sw_version);
+	printk("Memfault hardware version: %s\n", memfault_hw_version);
+	printk("Memfault software type: %s\n", memfault_sw_type);
+
+	image_version_loaded = true;
+	#else
 	fwid.company_id = sys_cpu_to_le16(CONFIG_BT_COMPANY_ID);
 	fwid.major = img_ver.major;
 	fwid.minor = img_ver.minor;
@@ -268,7 +357,33 @@ static void image_version_load(void)
 
 	printk("Current image version: %u.%u.%u+%u\n", img_ver.major, img_ver.minor,
 	       img_ver.revision, img_ver.build_num);
+	#endif
 }
+
+#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+
+const char *dfu_target_memfault_software_version_get(void)
+{
+	image_version_load();
+
+	if (!image_version_loaded) {
+		return NULL;
+	}
+
+	return memfault_sw_version;
+}
+
+const char *dfu_target_memfault_hardware_version_get(void)
+{
+	return MEMFAULT_HW_VERSION_STR;
+}
+
+const char *dfu_target_memfault_software_type_get(void)
+{
+	return CONFIG_MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE;
+}
+
+#endif
 
 int dfu_target_init(struct bt_mesh_blob_io_flash *flash_stream)
 {

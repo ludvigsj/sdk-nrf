@@ -16,6 +16,10 @@ target_sources(app PRIVATE ${app_sources}
   ${dfu_common_dir}/dfu_target.c
 )
 
+target_sources_ifdef(CONFIG_MEMFAULT_NCS_DEVICE_INFO_CUSTOM app PRIVATE
+  ${dfu_common_dir}/memfault_device_info.c
+)
+
 target_sources_ifdef(CONFIG_NCS_SAMPLE_MCUMGR_BT_OTA_DFU app PRIVATE
   ${ZEPHYR_NRF_MODULE_DIR}/samples/bluetooth/mesh/common/smp_bt.c
 )
