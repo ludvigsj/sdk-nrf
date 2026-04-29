@@ -32,6 +32,15 @@ from elftools.elf.elffile import ELFFile
 FILE_NAME_IN_ZIP = 'ble_mesh_metadata.json'
 FILE_NAME = 'dfu_application.zip_ble_mesh_metadata.json'
 
+FWID_TYPE_MEMFAULT = 0xFF
+FWID_COMPANY_ID_LEN = 2
+FWID_TYPE_LEN = 1
+FWID_HW_VERSION_LEN = 1
+FWID_SW_VERSION_LEN = 1
+FWID_SW_TYPE_LEN = 1
+FWID_MEMFAULT_PREFIX_LEN = (FWID_COMPANY_ID_LEN + FWID_TYPE_LEN + FWID_HW_VERSION_LEN +
+                            FWID_SW_VERSION_LEN + FWID_SW_TYPE_LEN)
+
 
 def exit_with_error_msg():
     traceback.print_exc()
@@ -188,6 +197,40 @@ class KConfig(dict):
             return str(fwid.hex())
         except Exception as err :
             raise Exception("Unable to generate FWID using mcuboot version") from err
+
+    def fwid_memfault_get(self):
+        try:
+            version = self.version_parse()
+            company_id = int(self['CONFIG_BT_COMPANY_ID'], 0)
+            hw_version = self['CONFIG_MESH_DFU_SAMPLE_MEMFAULT_HW_VERSION'].strip('"')
+            sw_type = self['CONFIG_MESH_DFU_SAMPLE_MEMFAULT_SW_TYPE'].strip('"')
+            sw_version = (f"{version['major']}.{version['minor']}.{version['revision']}+"
+                          f"{version['build_number']}")
+
+            hw_bytes = hw_version.encode('utf-8')
+            sw_bytes = sw_version.encode('utf-8')
+            sw_type_bytes = sw_type.encode('utf-8')
+
+            if len(hw_bytes) > 0xFF:
+                raise Exception("Memfault HW version exceeds 255 bytes")
+            if len(sw_bytes) > 0xFF:
+                raise Exception("Memfault SW version exceeds 255 bytes")
+            if len(sw_type_bytes) > 0xFF:
+                raise Exception("Memfault SW type exceeds 255 bytes")
+
+            fwid = bytearray()
+            fwid.extend(company_id.to_bytes(2, 'little'))
+            fwid.append(FWID_TYPE_MEMFAULT)
+            fwid.append(len(hw_bytes))
+            fwid.append(len(sw_bytes))
+            fwid.append(len(sw_type_bytes))
+            fwid.extend(hw_bytes)
+            fwid.extend(sw_bytes)
+            fwid.extend(sw_type_bytes)
+
+            return str(fwid.hex())
+        except Exception as err:
+            raise Exception("Unable to generate FWID using memfault HW/SW version format") from err
 
 
 def read_symbol_data(elf, symbol_addr):
@@ -415,7 +458,9 @@ def is_hex_string(s):
     return len(s) % 2 == 0 and all(c in string.hexdigits for c in s)
 
 def compute_fwid(sysbuild_kconfigs, kconfigs):
-    if "SB_CONFIG_DFU_ZIP_BLUETOOTH_MESH_METADATA_FWID_CUSTOM" in sysbuild_kconfigs:
+    if kconfigs.get('CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID') == 'y':
+        return kconfigs.fwid_memfault_get()
+    elif "SB_CONFIG_DFU_ZIP_BLUETOOTH_MESH_METADATA_FWID_CUSTOM" in sysbuild_kconfigs:
         fwid = sysbuild_kconfigs["SB_CONFIG_DFU_ZIP_BLUETOOTH_MESH_METADATA_FWID_CUSTOM_HEX"].strip('"')
         if not is_hex_string(fwid):
             raise Exception("Value of SB_CONFIG_DFU_ZIP_BLUETOOTH_MESH_METADATA_FWID_CUSTOM_HEX is not a hex string")

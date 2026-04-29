@@ -22,6 +22,12 @@ extern struct bt_mesh_dfu_srv dfu_srv;
 int dfu_target_init(struct bt_mesh_blob_io_flash *flash_stream);
 void dfu_target_image_confirm(void);
 
+#if defined(CONFIG_MESH_DFU_SAMPLE_MEMFAULT_FWID)
+const char *dfu_target_memfault_software_version_get(void);
+const char *dfu_target_memfault_hardware_version_get(void);
+const char *dfu_target_memfault_software_type_get(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
