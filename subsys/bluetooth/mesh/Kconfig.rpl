@@ -4,6 +4,11 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 
+# Virtual option enabled when the NCS implementation of RPL should be used
+# instead of the Zephyr one.
+config BT_MESH_RPL_NCS
+	bool
+
 choice BT_MESH_RPL_STORAGE_MODE
 	prompt "Replay protection list storage mode"
 	default BT_MESH_RPL_STORAGE_MODE_EMDS if EMDS
@@ -11,8 +16,16 @@ choice BT_MESH_RPL_STORAGE_MODE
 config BT_MESH_RPL_STORAGE_MODE_EMDS
 	bool "Persistent storage of RPL in Emergency Data Storage"
 	depends on EMDS
+	select BT_MESH_RPL_NCS
 	help
 	  Persistent storage of RPL in Emergency Data Storage.
+
+config BT_MESH_RPL_STORAGE_MODE_ZMS
+	bool "Persistent storage of RPL in Zephyr Memory Storage"
+	depends on ZMS
+	select BT_MESH_RPL_NCS
+	help
+	  Persistent storage of RPL in Zephyr Memory Storage.
 
 endchoice
 
@@ -27,3 +40,16 @@ config BT_MESH_RPL_INDEX
 	  Emergency Data Storage.
 
 endif # BT_MESH_RPL_STORAGE_MODE_EMDS
+
+if BT_MESH_RPL_STORAGE_MODE_ZMS
+
+config BT_MESH_RPL_ZMS_STORE_TIMEOUT
+	int "Timeout for storing RPL data in Zephyr Memory Storage"
+	range -1 1000000
+	default 5
+	help
+	  This value defines the timeout in seconds for storing RPL data in
+	  Zephyr Memory Storage. The RPL data will be stored after this timeout
+	  if any changes have been made to the RPL.
+
+endif # BT_MESH_RPL_STORAGE_MODE_ZMS
