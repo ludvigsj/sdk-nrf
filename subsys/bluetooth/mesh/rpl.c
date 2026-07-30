@@ -139,8 +139,11 @@ static void store_work_handler(struct k_work *work)
 
 	for (int i = 0; i < PAIR_COUNT; i++) {
 		if (atomic_test_and_clear_bit(store_pairs, i)) {
-			if (most_recent_half_pair_idx == i) {
+			bool is_half_pair = replay_list[(i * 2) + 1].src == 0;
+
+			if (most_recent_half_pair_idx == i && !is_half_pair) {
 				remove_half_pair(i);
+				most_recent_half_pair_idx = -1;
 			}
 			store_pair(i);
 		}
