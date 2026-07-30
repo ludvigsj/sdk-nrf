@@ -19,11 +19,6 @@ LOG_MODULE_REGISTER(bt_mesh_rpl);
 
 static struct bt_mesh_rpl replay_list[CONFIG_BT_MESH_CRPL];
 
-/*
- * TODO: Consider splitting out the common parts and keep EMDS and ZMS-related
- * code in separate smaller files using the functions in the common file, to
- * avoid all these conditional blocks in this file.
- */
 #if defined(CONFIG_BT_MESH_RPL_STORAGE_MODE_EMDS)
 #include <emds/emds.h>
 
@@ -95,18 +90,6 @@ static void remove_half_pair(int i)
 static int clear_storage(void) {
 	int err;
 
-	/*
-	 * TODO: Figure out whether this is the most sensible solution here.
-	 * zms_clear will erase all the sectors in the partition, which will
-	 * certainly accomplish what we want. Clearing is a rare occurrence
-	 * compared to updating the RPL, so I would suggest not spending too
-	 * much time over-engineering the clear operation just to save a few
-	 * dozen page erases over the node lifetime. But the numbers on this
-	 * should be checked (keep in mind that zms_delete will also cause
-	 * some erases because of GC, and erasing the entire partition will
-	 * delay the next GC because after the remount ZMS will have a lot of
-	 * empty sectors to work with for a while.)
-	 */
 	err = zms_clear(&rpl_zms_fs);
 	if (err) {
 		LOG_ERR("Failed to clear ZMS, err %d", err);
