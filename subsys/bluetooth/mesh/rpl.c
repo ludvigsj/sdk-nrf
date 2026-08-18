@@ -74,6 +74,16 @@ static uint32_t rpl_zms_id(uint16_t src1, uint16_t src2)
 	return ((uint32_t)src1 << 16) | src2;
 }
 
+static uint16_t rpl_zms_id_src1(uint32_t id)
+{
+	return id >> 16;
+}
+
+static uint16_t rpl_zms_id_src2(uint32_t id)
+{
+	return id & 0xFFFF;
+}
+
 /* RPL entries are divided into pairs of sequential (even, odd) RPL entries. */
 static int pair_idx_of(const struct bt_mesh_rpl *rpl)
 {
@@ -154,6 +164,199 @@ static void clear_storage(void)
 	}
 
 	most_recent_half_pair_idx = -1;
+}
+
+enum rpl_zms_id_check_result {
+	RPL_ZMS_ID_CHECK_VALID,
+	RPL_ZMS_ID_CHECK_INVALID,
+	RPL_ZMS_ID_CHECK_IGNORE,
+};
+
+static enum rpl_zms_id_check_result rpl_zms_id_check(uint32_t id, size_t len)
+{
+	uint16_t src1 = rpl_zms_id_src1(id);
+	uint16_t src2 = rpl_zms_id_src2(id);
+
+	if (!BT_MESH_ADDR_IS_UNICAST(src1) ||
+	    (src2 != 0 && !BT_MESH_ADDR_IS_UNICAST(src2)) ||
+	    (src1 == src2)) {
+		LOG_WRN("Unexpected ZMS entry with invalid id 0x%08x", id);
+		return RPL_ZMS_ID_CHECK_INVALID;
+	}
+
+	if (src2 == 0 && len == 0) {
+		/* This is a half pair delete marker, which is expected. */
+		return RPL_ZMS_ID_CHECK_IGNORE;
+	}
+
+	if (len != sizeof(struct rpl_val) * 2) {
+		LOG_WRN("Unexpected ZMS entry length %zu for id 0x%08x", len, id);
+		return RPL_ZMS_ID_CHECK_INVALID;
+	}
+
+	return RPL_ZMS_ID_CHECK_VALID;
+}
+
+struct rpl_restore_ctx {
+	struct {
+		uint16_t src;
+		struct rpl_val val;
+	} pending_half_pair;
+	int next_free;
+};
+
+static struct bt_mesh_rpl *rpl_append(struct rpl_restore_ctx *ctx, uint16_t src,
+				      struct rpl_val pair)
+{
+	if (ctx->next_free >= ARRAY_SIZE(replay_list)) {
+		LOG_ERR("RPL restore failed: Not enough space for new entry");
+		return NULL;
+	}
+	replay_list[ctx->next_free].src = src;
+	replay_list[ctx->next_free].seq = pair.seq;
+	replay_list[ctx->next_free].old_iv = pair.old_iv;
+	return &replay_list[ctx->next_free++];
+}
+
+static int rpl_restore_half_pair(struct rpl_restore_ctx *ctx, uint32_t id, struct rpl_val *data)
+{
+	uint16_t src1 = rpl_zms_id_src1(id);
+
+	for (int i = 0; i < ctx->next_free; i++) {
+		if (replay_list[i].src == src1) {
+			if (i % 2 == 0) {
+				/* Already superseded by a full pair already in the RPL. */
+				return 0;
+			}
+
+			LOG_ERR("RPL inconsistency: Half pair 0x%08x already at odd index", id);
+			return -EINVAL;
+		}
+	}
+
+	if (ctx->pending_half_pair.src == src1) {
+		return 0; /* Skip this, we have a newer version already. */
+	} else if (ctx->pending_half_pair.src != 0) {
+		LOG_ERR("RPL inconsistency: Multiple half pairs found");
+		return -EINVAL;
+	}
+
+	if (data[1].seq != 0 || data[1].old_iv != 0) {
+		LOG_ERR("Half pair ATE for id 0x%08x has non-zero second half", id);
+		return -EINVAL;
+	}
+
+	ctx->pending_half_pair.src = src1;
+	ctx->pending_half_pair.val = data[0];
+	return 0;
+}
+
+static bool is_pair_at(const struct rpl_restore_ctx *ctx, int i, uint32_t id)
+{
+	if (i % 2 != 0 || i + 1 >= ctx->next_free) {
+		return false;
+	}
+	return (replay_list[i].src == rpl_zms_id_src1(id)) &&
+	       (replay_list[i + 1].src == rpl_zms_id_src2(id));
+}
+
+static int rpl_restore_full_pair(struct rpl_restore_ctx *ctx, uint32_t id, struct rpl_val *data)
+{
+	uint16_t src1 = rpl_zms_id_src1(id);
+	uint16_t src2 = rpl_zms_id_src2(id);
+	struct bt_mesh_rpl *rpl;
+
+	for (int i = 0; i < ctx->next_free; i++) {
+		if (is_pair_at(ctx, i, id)) {
+			return 0; /* Skip this - we have a newer version already. */
+		} else if (replay_list[i].src == src1 ||
+			   replay_list[i].src == src2) {
+			LOG_ERR("RPL inconsistency: partial match for id 0x%08x", id);
+			return -EINVAL;
+		}
+	}
+
+	if (ctx->pending_half_pair.src == src1 ||
+	    ctx->pending_half_pair.src == src2) {
+		LOG_ERR("RPL inconsistency: pending half pair conflict for id 0x%08x", id);
+		return -EINVAL;
+	}
+
+	rpl = rpl_append(ctx, src1, data[0]);
+	if (rpl == NULL) {
+		return -ENOMEM;
+	}
+	rpl = rpl_append(ctx, src2, data[1]);
+	if (rpl == NULL) {
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+static int rpl_insert_pending_half_pair(struct rpl_restore_ctx *ctx)
+{
+	struct bt_mesh_rpl *rpl;
+
+	if (ctx->pending_half_pair.src != 0) {
+		rpl = rpl_append(ctx, ctx->pending_half_pair.src, ctx->pending_half_pair.val);
+		if (rpl == NULL) {
+			return -ENOMEM;
+		}
+		most_recent_half_pair_idx = pair_idx_of(rpl);
+	}
+	return 0;
+}
+
+static int rpl_restore(void)
+{
+	int rc;
+	int err;
+	int deferred_err = 0;
+	struct zms_iter iter;
+	zms_id_t id;
+	size_t len;
+	struct rpl_restore_ctx ctx = { 0 };
+	struct rpl_val data[2] = { 0 };
+
+	__ASSERT_NO_MSG(sizeof(data) <= ZMS_DATA_IN_ATE_SIZE);
+
+	err = zms_iter_init(&rpl_zms_fs, &iter);
+	if (err != 0) {
+		LOG_ERR("Failed to initialize ZMS iterator, err %d", err);
+		return -EIO;
+	}
+
+	while ((rc = zms_iter_next_all(&rpl_zms_fs, &iter, &id, &len, data, sizeof(data))) == 1) {
+		switch (rpl_zms_id_check(id, len)) {
+		case RPL_ZMS_ID_CHECK_IGNORE:
+			break;
+		case RPL_ZMS_ID_CHECK_VALID:
+			err = (rpl_zms_id_src2(id) == 0) ? rpl_restore_half_pair(&ctx, id, data)
+							 : rpl_restore_full_pair(&ctx, id, data);
+			if (err == -EINVAL) {
+				deferred_err = err;
+			} else if (err != 0) {
+				return err;
+			}
+			break;
+		case RPL_ZMS_ID_CHECK_INVALID:
+		default:
+			deferred_err = -EINVAL;
+			break;
+		}
+	}
+
+	err = rpl_insert_pending_half_pair(&ctx);
+	if (err != 0) {
+		return err;
+	}
+
+	if (rc < 0) {
+		LOG_ERR("Failed to iterate over ZMS, err %d", rc);
+		return -EIO;
+	}
+
+	return deferred_err;
 }
 
 #endif /* CONFIG_BT_MESH_RPL_STORAGE_MODE_ZMS */
@@ -349,7 +552,11 @@ int bt_mesh_rpl_init(void)
 		return -EACCES;
 	}
 
-	/* TODO: This is where the reload should happen. */
+	err = rpl_restore();
+	if (err) {
+		LOG_ERR("Failed to restore RPL from ZMS, err %d", err);
+		return err;
+	}
 #endif /* CONFIG_BT_MESH_RPL_STORAGE_MODE_ZMS */
 
 	return 0;
