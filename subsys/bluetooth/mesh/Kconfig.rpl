@@ -23,6 +23,7 @@ config BT_MESH_RPL_STORAGE_MODE_EMDS
 config BT_MESH_RPL_STORAGE_MODE_ZMS
 	bool "Persistent storage of RPL in Zephyr Memory Storage"
 	depends on ZMS
+	depends on !ZMS_ID_64BIT
 	select BT_MESH_RPL_NCS
 	select EXPERIMENTAL
 	help
