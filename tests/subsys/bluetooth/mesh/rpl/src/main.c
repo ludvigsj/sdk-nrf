@@ -27,6 +27,7 @@ static void rx_ok(uint16_t addr, uint32_t seq);
 /* ======================== Mocks =========================================== */
 static struct {
 	struct zms_fs *zms_fs;
+	struct zms_iter *zms_iter;
 } global_mock_data;
 
 #define MOCK_DATA_POOL_SIZE 16
@@ -35,6 +36,15 @@ static struct {
 	pair_t pool[MOCK_DATA_POOL_SIZE];
 	size_t count;
 } mock_write_data;
+
+static struct {
+	struct iter_output {
+		zms_id_t id;
+		size_t len;
+		uint8_t data[ZMS_DATA_IN_ATE_SIZE];
+	} pool[MOCK_DATA_POOL_SIZE];
+	size_t count;
+} mock_iter_data;
 
 /* Used to simulate a concurrent update mid-write. */
 static struct {
@@ -86,6 +96,32 @@ void bt_mesh_settings_store_schedule(enum bt_mesh_settings_flag flag)
 	ztest_check_expected_value(flag);
 }
 
+int zms_iter_init(const struct zms_fs *fs, struct zms_iter *iter)
+{
+	zassert_equal(fs, global_mock_data.zms_fs);
+	global_mock_data.zms_iter = iter;
+	return ztest_get_return_value();
+}
+
+int zms_iter_next_all(struct zms_fs *fs, struct zms_iter *iter, zms_id_t *id, size_t *len,
+		      void *data, size_t data_len)
+{
+	zassert_equal(fs, global_mock_data.zms_fs);
+	zassert_equal(iter, global_mock_data.zms_iter);
+
+	int rc = ztest_get_return_value();
+
+	if (rc == 1) {
+		ztest_copy_return_data(id, sizeof(*id));
+		ztest_copy_return_data(len, sizeof(*len));
+		if (*len > 0 && *len <= ZMS_DATA_IN_ATE_SIZE) {
+			ztest_copy_return_data(data, MIN(*len, data_len));
+		}
+	}
+
+	return rc;
+}
+
 /* ======================== End Mocks ======================================= */
 
 #define PAIR_ID(first_addr, second_addr) (((uint32_t)(first_addr) << 16) | (second_addr))
@@ -104,6 +140,31 @@ static void expect_zms_delete(zms_id_t expected_id)
 static void expect_zms_clear(void)
 {
 	ztest_returns_value(zms_clear, 0);
+}
+
+static void expect_zms_iter_init(int return_value)
+{
+	ztest_returns_value(zms_iter_init, return_value);
+}
+
+static void expect_zms_iter_next_all(int return_value, zms_id_t mock_id, size_t mock_len,
+				     const void *mock_zms_data)
+{
+	ztest_returns_value(zms_iter_next_all, return_value);
+	if (return_value == 1) {
+		zassert(mock_iter_data.count < ARRAY_SIZE(mock_iter_data.pool),
+			"Can't fit mock zms iter data");
+		struct iter_output *mock_data = &mock_iter_data.pool[mock_iter_data.count++];
+
+		mock_data->id = mock_id;
+		mock_data->len = mock_len;
+		if (mock_len > 0 && mock_len <= ZMS_DATA_IN_ATE_SIZE) {
+			memcpy(mock_data->data, mock_zms_data, mock_len);
+			ztest_return_data(zms_iter_next_all, data, mock_data->data);
+		}
+		ztest_return_data(zms_iter_next_all, id, &mock_data->id);
+		ztest_return_data(zms_iter_next_all, len, &mock_data->len);
+	}
 }
 
 static void expect_zms_mount(int err)
@@ -148,6 +209,70 @@ static void expect_half_pair_delete(uint16_t first_addr)
 	zms_id_t expected_id = PAIR_ID(first_addr, 0);
 
 	expect_zms_delete(expected_id);
+}
+
+static void expect_zms_iter_next_entry(uint16_t first_addr, uint32_t first_seq, bool first_old_iv,
+				       uint16_t second_addr, uint32_t second_seq,
+				       bool second_old_iv)
+{
+	zms_id_t expected_id = PAIR_ID(first_addr, second_addr);
+	pair_t data = {
+		{
+			.seq = first_seq,
+			.old_iv = first_old_iv,
+		},
+		{
+			.seq = second_seq,
+			.old_iv = second_old_iv,
+		},
+	};
+
+	expect_zms_iter_next_all(1, expected_id, sizeof(pair_t), data);
+}
+
+/** Used for cases where we don't expect the RPL module to use the `data`
+ *  returned from the iterator, to avoid a lot of false/0 in calls in the test
+ *  cases.
+ */
+static void expect_zms_iter_next_dummy_entry(uint16_t first_addr, uint16_t second_addr)
+{
+	zms_id_t expected_id = PAIR_ID(first_addr, second_addr);
+	uint8_t dummy_data[ZMS_DATA_IN_ATE_SIZE] = { 0 };
+
+	expect_zms_iter_next_all(1, expected_id, sizeof(pair_t), dummy_data);
+}
+
+static void expect_zms_iter_next_deleted_half_pair(uint16_t first_addr)
+{
+	zms_id_t expected_id = PAIR_ID(first_addr, 0);
+
+	expect_zms_iter_next_all(1, expected_id, 0, NULL);
+}
+
+static void expect_zms_iter_next_malformed(uint32_t id, size_t len)
+{
+	uint8_t dummy_data[ZMS_DATA_IN_ATE_SIZE] = { 0 };
+
+	expect_zms_iter_next_all(1, id, len, dummy_data);
+}
+
+static void expect_zms_iter_next_end(void)
+{
+	expect_zms_iter_next_all(0, 0, 0, NULL);
+}
+
+static void expect_zms_iter_next_error(int err)
+{
+	expect_zms_iter_next_all(err, 0, 0, NULL);
+}
+
+/* Sets up mock expectations for a successful zms_mount() followed by
+ * zms_iter_init(), the common starting point for most restore tests.
+ */
+static void expect_rpl_init_setup_ok(void)
+{
+	expect_zms_mount(0);
+	expect_zms_iter_init(0);
 }
 
 static bool rpl_check(uint16_t addr, uint32_t seq, bool old_iv, uint8_t net_if,
@@ -204,6 +329,45 @@ static void schedule_rx_mid_write(uint16_t addr, uint32_t seq)
 	rx_mid_write.seq = seq;
 }
 
+static void verify_restored_rpl_entry(uint16_t addr, uint32_t seq, bool old_iv)
+{
+	if (old_iv) {
+		rx_expect_reject_old_iv(addr, seq);
+		rx_ok_old_iv(addr, seq + 1);
+	} else {
+		rx_expect_reject_old_iv(addr, seq + 1);
+		rx_expect_reject(addr, seq);
+		rx_ok(addr, seq + 1);
+	}
+}
+
+/* Sets up mock expectations to restore CONFIG_BT_MESH_CRPL/2 full pairs, filling
+ * the RPL to capacity.
+ */
+static void expect_restore_full_rpl(void)
+{
+	zassert_true(CONFIG_BT_MESH_CRPL % 2 == 0, "CRPL must be even for this test");
+
+	for (int i = 0; i < CONFIG_BT_MESH_CRPL; i += 2) {
+		expect_zms_iter_next_entry(i + 1, i + 1, false, i + 2, i + 2, false);
+	}
+}
+
+/* Verifies that the pairs set up by expect_restore_full_rpl() were properly restored. */
+static void verify_restored_full_rpl(void)
+{
+	for (int i = 0; i < CONFIG_BT_MESH_CRPL; i += 2) {
+		verify_restored_rpl_entry(i + 1, i + 1, false);
+		verify_restored_rpl_entry(i + 2, i + 2, false);
+	}
+}
+
+static void uninit_rpl(void)
+{
+	global_mock_data.zms_fs = NULL;
+	global_mock_data.zms_iter = NULL;
+}
+
 static void clear_rpl(void)
 {
 	expect_store_schedule();
@@ -216,13 +380,15 @@ static void clear_rpl(void)
 static void reset_mock_data(void)
 {
 	mock_write_data.count = 0;
+	mock_iter_data.count = 0;
 	rx_mid_write.addr = 0;
 	rx_mid_write.seq = 0;
 }
 
 static void *setup(void)
 {
-	expect_zms_mount(0);
+	expect_rpl_init_setup_ok();
+	expect_zms_iter_next_end();
 
 	zassert_ok(bt_mesh_rpl_init());
 
@@ -235,6 +401,13 @@ static void after(void *f)
 
 	clear_rpl();
 	reset_mock_data();
+}
+
+static void teardown(void *f)
+{
+	ARG_UNUSED(f);
+
+	uninit_rpl();
 }
 
 /** Verify that the RPL correctly stores full pairs (an even number of entries):
@@ -515,4 +688,392 @@ ZTEST(bt_mesh_rpl_ncs, test_rpl_clear)
 	trigger_store();
 }
 
-ZTEST_SUITE(bt_mesh_rpl_ncs, NULL, setup, NULL, after, NULL);
+ZTEST_SUITE(bt_mesh_rpl_ncs, NULL, setup, NULL, after, teardown);
+
+static void restore_after(void *f)
+{
+	ARG_UNUSED(f);
+
+	clear_rpl();
+	uninit_rpl();
+	reset_mock_data();
+}
+
+/** Verify that full pairs stored in ZMS are restored into the RPL on init. */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_full_pairs)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Set up some mock data to restore. */
+	expect_zms_iter_next_entry(0x3, 3, true, 0x4, 42, false);
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	/* Verify that the restored data is present in the RPL. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+	verify_restored_rpl_entry(0x3, 3, true);
+	verify_restored_rpl_entry(0x4, 42, false);
+}
+
+/** Verify that a half pair stored in ZMS is restored on init, and that it is
+ *  correctly promoted to a full pair (with the half-pair marker deleted) when
+ *  a new entry arrives.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_half_pair)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Set up some mock data to restore. */
+	expect_zms_iter_next_entry(0xab, 20, false, 0, 0, false);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	/* Verify that the restored data is present in the RPL. */
+	verify_restored_rpl_entry(0xab, 20, false);
+
+	/* Check that the pair correctly gets promoted to a full pair. */
+	rx_ok(0xcd, 30);
+	expect_pair_write(0xab, 21, false, 0xcd, 30, false);
+	expect_half_pair_delete(0xab);
+	trigger_store();
+}
+
+/** Verify that a mix of full pairs and a half pair is restored on init, and
+ *  that the restored half pair is later promoted to a full pair when a new
+ *  entry arrives.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_mixed)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Set up some mock data to restore. */
+	expect_zms_iter_next_entry(0x5, 5, true, 0, 0, false);
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_entry(0x3, 3, true, 0x4, 4, false);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	/* Verify that the restored data is present in the RPL. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+	verify_restored_rpl_entry(0x3, 3, true);
+	verify_restored_rpl_entry(0x4, 4, false);
+	verify_restored_rpl_entry(0x5, 5, true);
+
+	/* Check that the half pair correctly gets promoted to a full pair. */
+	rx_ok(0xabc, 10);
+	expect_pair_write(0x1, 2, false, 0x2, 3, true);
+	expect_pair_write(0x3, 4, true, 0x4, 5, false);
+	expect_pair_write(0x5, 6, true, 0xabc, 10, false);
+	expect_half_pair_delete(0x5);
+	trigger_store();
+}
+
+/** Verify three "not an error" restore branches in one scan: a full-pair entry
+ *  that exactly duplicates an already-restored pair (skipped, not read), a
+ *  delete marker for the half pair that was later completed into that full
+ *  pair (ignored), and the half pair's own stale, not-yet-compacted-away ZMS
+ *  entry appearing after its delete marker (superseded, skipped, not read).
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_skip_superseded_entries)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	/* All of the following are "superseded data" and should be ignored. */
+	expect_zms_iter_next_deleted_half_pair(0x1); /* Half pair delete marker. */
+	expect_zms_iter_next_dummy_entry(0x1, 0x2); /* Older copy of the full pair above. */
+	/* Stale half pair, superseded by the full pair. */
+	expect_zms_iter_next_dummy_entry(0x1, 0);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	/* Verify that the restored pair is present. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+}
+
+/** Verify that an entry with an invalid id (here, src1 == src2) among otherwise
+ *  valid entries is skipped, the rest of the scan continues, and the final
+ *  result is -EINVAL.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_invalid_id)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_malformed(PAIR_ID(0x9, 0x9), sizeof(pair_t));
+	expect_zms_iter_next_entry(0x3, 3, true, 0x4, 4, false);
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that valid entries both before and after the invalid-id entry were restored. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+	verify_restored_rpl_entry(0x3, 3, true);
+	verify_restored_rpl_entry(0x4, 4, false);
+}
+
+/** Verify that an entry with an unexpected (non-delete-marker) length among
+ *  otherwise valid entries is skipped, and the final result is -EINVAL.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_bad_length)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_malformed(PAIR_ID(0x9, 0x8), sizeof(pair_t) - 1);
+	expect_zms_iter_next_entry(0x3, 3, true, 0x4, 4, false);
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that valid entries both before and after the bad-length entry were restored. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+	verify_restored_rpl_entry(0x3, 3, true);
+	verify_restored_rpl_entry(0x4, 4, false);
+}
+
+/** Verify that a second half pair (only one live half pair is allowed at a
+ *  time) is rejected with -EINVAL without being read, while the first half
+ *  pair found is still restored.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_duplicate_half_pair)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0xaa, 42, false, 0, 0, false);
+	expect_zms_iter_next_dummy_entry(0xbb, 0); /* Second half pair, rejected without a read. */
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that only the first half pair was restored. */
+	verify_restored_rpl_entry(0xaa, 42, false);
+	rx_ok(0xbb, 1);
+}
+
+/** Verify that a full-pair entry whose src1 or src2 partially overlaps an
+ *  already-restored entry is rejected with -EINVAL (without being read),
+ *  while the already-restored pair is unaffected.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_partial_match)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	/* src1 (0x2) partially matches the pair above. */
+	expect_zms_iter_next_dummy_entry(0x2, 0x5);
+	/* src2 (0x2) partially matches the pair above. */
+	expect_zms_iter_next_dummy_entry(0x9, 0x2);
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that the valid pair was still restored despite the later conflicts. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+}
+
+/** Verify that a full-pair entry formed from the two "middle" sources of two
+ *  already-restored pairs (A,B) and (C,D) - i.e. (B,C) - is rejected with
+ *  -EINVAL. Pairs are only recognized at even indices, so (B,C) must not be
+ *  mistaken for an already-restored pair even though both sources are present.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_cross_pair_overlap)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_entry(0x3, 3, true, 0x4, 4, false);
+	expect_zms_iter_next_dummy_entry(0x2, 0x3); /* (B, C): straddles both pairs above. */
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that both original pairs were still restored despite the conflict. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+	verify_restored_rpl_entry(0x3, 3, true);
+	verify_restored_rpl_entry(0x4, 4, false);
+}
+
+/** Verify that a full-pair entry conflicting with an already-encountered half
+ *  pair is rejected with -EINVAL, whether the half pair's source appears as
+ *  src1 or src2 of the full pair, while the half pair is still restored.
+ *  Half pairs are always older than the full pair that completes them, and
+ *  the iterator yields newer entries first, so seeing the half pair before
+ *  its full pair (as mocked here) should produce EINVAL.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_half_pair_conflict)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Half pair. */
+	expect_zms_iter_next_entry(0x5, 42, false, 0, 0, false);
+	/* Full pair for same addr, which should have appeared before the half pair. */
+	expect_zms_iter_next_dummy_entry(0x5, 0x9);
+	/* Same conflict, but with the half pair's source as src2 instead. */
+	expect_zms_iter_next_dummy_entry(0x6, 0x5);
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that the half pair was still restored despite the conflicts. */
+	verify_restored_rpl_entry(0x5, 42, false);
+}
+
+/** Verify that a half-pair entry whose src1 matches the src2 (odd-index) half
+ *  of an already-restored full pair is rejected with -EINVAL (without being
+ *  read), while the already-restored pair is unaffected.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_einval_half_pair_odd_index_conflict)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	/* src1 (0x2) matches the pair's src2 above. */
+	expect_zms_iter_next_dummy_entry(0x2, 0);
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -EINVAL);
+
+	/* Verify that the valid pair was still restored despite the later conflict. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+}
+
+/** Verify that a full-pair entry that would exceed CONFIG_BT_MESH_CRPL capacity
+ *  results in an immediate -ENOMEM: the entry is still read before the
+ *  capacity check, but the scan aborts and no further entries are consumed.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_enomem_capacity_exceeded)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_restore_full_rpl();
+	/* Would exceed CRPL capacity. */
+	expect_zms_iter_next_entry(0x7ffe, 1, false, 0x7fff, 2, false);
+
+	zassert_equal(bt_mesh_rpl_init(), -ENOMEM);
+
+	verify_restored_full_rpl();
+}
+
+/** Verify that an -ENOMEM from exceeding CONFIG_BT_MESH_CRPL capacity takes
+ *  precedence over an earlier malformed entry that alone would have caused
+ *  -EINVAL.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_enomem_precedence_over_einval)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Malformed entry; would cause -EINVAL on its own. */
+	expect_zms_iter_next_malformed(PAIR_ID(0xffff, 0xffff), sizeof(pair_t));
+	expect_restore_full_rpl();
+	/* Would exceed CRPL capacity. */
+	expect_zms_iter_next_entry(0x7ffe, 1, false, 0x7fff, 2, false);
+
+	/* Ensure that ENOMEM is returned instead of EINVAL. */
+	zassert_equal(bt_mesh_rpl_init(), -ENOMEM);
+
+	verify_restored_full_rpl();
+}
+
+/** Verify that a pending half pair that can't be inserted because the RPL is
+ *  already at CONFIG_BT_MESH_CRPL capacity results in -ENOMEM.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_enomem_from_pending_half_pair_insert)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x7fff, 1, false, 0, 0, false);
+	expect_restore_full_rpl();
+	expect_zms_iter_next_end();
+
+	zassert_equal(bt_mesh_rpl_init(), -ENOMEM);
+
+	verify_restored_full_rpl();
+}
+
+/** Verify that the -ENOMEM from a pending half pair that can't be inserted
+ *  because the RPL is already at CONFIG_BT_MESH_CRPL capacity takes
+ *  precedence over an iterator hard failure that would otherwise produce
+ *  -EIO.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_enomem_precedence_over_eio)
+{
+	expect_rpl_init_setup_ok();
+
+	expect_zms_iter_next_entry(0x7fff, 1, false, 0, 0, false);
+	expect_restore_full_rpl();
+	expect_zms_iter_next_error(-EIO);
+
+	zassert_equal(bt_mesh_rpl_init(), -ENOMEM);
+
+	verify_restored_full_rpl();
+}
+
+/** Verify that a zms_iter_init() failure results in an immediate -EIO, with
+ *  the RPL left empty since the scan never runs.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_eio_iter_init_failure)
+{
+	expect_zms_mount(0);
+	expect_zms_iter_init(-EINVAL);
+
+	zassert_equal(bt_mesh_rpl_init(), -EIO);
+}
+
+/** Verify that a hard iterator failure mid-scan still restores the entries
+ *  seen before it, still restores a half pair left pending at the point of
+ *  failure, and returns -EIO.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_eio_mid_scan)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Half pair, still pending at the failure. */
+	expect_zms_iter_next_entry(0x3, 3, true, 0, 0, false);
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_error(-ENXIO);
+
+	zassert_equal(bt_mesh_rpl_init(), -EIO);
+
+	/* Verify entries seen before the failure, including the pending half pair, restored. */
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+	verify_restored_rpl_entry(0x3, 3, true);
+}
+
+/** Verify that a hard iterator failure takes precedence over an earlier
+ *  malformed entry that alone would result in -EINVAL.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_eio_precedence_over_einval)
+{
+	expect_rpl_init_setup_ok();
+
+	/* Malformed entry; would cause -EINVAL on its own. */
+	expect_zms_iter_next_malformed(PAIR_ID(0xffff, 0xffff), sizeof(pair_t));
+	expect_zms_iter_next_error(-ENXIO);
+
+	zassert_equal(bt_mesh_rpl_init(), -EIO);
+}
+
+/** Verify that a zms_mount() failure results in -EACCES, with the iterator never invoked. */
+ZTEST(bt_mesh_rpl_ncs_restore, test_init_mount_failure_eaccess)
+{
+	expect_zms_mount(-EIO);
+
+	zassert_equal(bt_mesh_rpl_init(), -EACCES);
+}
+
+ZTEST_SUITE(bt_mesh_rpl_ncs_restore, NULL, NULL, NULL, restore_after, NULL);
