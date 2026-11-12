@@ -25,12 +25,20 @@ config BT_MESH_RPL_STORAGE_MODE_ZMS
 	depends on ZMS
 	depends on !ZMS_ID_64BIT
 	depends on FLASH_PAGE_LAYOUT
+	depends on FLASH_MAP
 	select BT_MESH_RPL_NCS
 	select BT_MESH_PENDING_STORE
+	select CRC
 	select EXPERIMENTAL
 	help
 	  Persistent storage of RPL directly in a dedicated ZMS partition.
 	  This approach does not use the Settings subsystem for RPL storage.
+
+	  The partition must be labeled rpl_partition. Its last sectors hold a
+	  backup of the RPL, which keeps the RPL safe across a power loss while
+	  it is rewritten after an IV Index update. The backup needs a header
+	  plus 8 bytes per entry of BT_MESH_CRPL, rounded up to whole sectors.
+	  ZMS uses the remaining sectors, and needs at least two of them.
 
 endchoice
 

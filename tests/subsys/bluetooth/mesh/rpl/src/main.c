@@ -8,6 +8,10 @@
 #include <zephyr/bluetooth/mesh.h>
 #include <zephyr/kvss/zms.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/drivers/flash/flash_simulator.h>
+#include <zephyr/storage/flash_map.h>
+#include <zephyr/sys/crc.h>
 #include <bluetooth/mesh/rpl.h>
 
 #include "net.h"
@@ -62,6 +66,32 @@ static struct {
 static K_SEM_DEFINE(write_entered, 0, 1);
 static K_SEM_DEFINE(write_release, 0, 1);
 static atomic_t zms_write_calls;
+
+/* Hooks the flash simulator's writes into the backup area, set up by hook_backup_writes(). */
+static struct {
+	off_t start;
+	off_t end;
+	/* Run once inside the next write into the backup area. */
+	void (*action)(void);
+	atomic_t writes;
+} backup_hook;
+
+static int backup_write_byte(const struct device *dev, off_t offset, uint8_t data)
+{
+	ARG_UNUSED(dev);
+
+	if (offset >= backup_hook.start && offset < backup_hook.end) {
+		void (*action)(void) = backup_hook.action;
+
+		(void)atomic_inc(&backup_hook.writes);
+		backup_hook.action = NULL;
+		if (action != NULL) {
+			action();
+		}
+	}
+
+	return data;
+}
 
 int zms_mount(struct zms_fs *fs)
 {
@@ -475,6 +505,7 @@ static void reset_mock_data(void)
 	k_sem_reset(&write_entered);
 	k_sem_reset(&write_release);
 	atomic_set(&zms_write_calls, 0);
+	backup_hook.action = NULL;
 }
 
 static void *setup(void)
@@ -1051,6 +1082,290 @@ ZTEST(bt_mesh_rpl_ncs, test_rpl_clear)
 	trigger_store();
 }
 
+/* ======================== Backup helpers ================================== */
+
+/* The backup helpers assume that the backup area is only the last sector of the partition.
+ * With a larger CRPL, rpl.c's backup_init() may use more sectors.
+ */
+BUILD_ASSERT(CONFIG_BT_MESH_CRPL == 8,
+	     "The backup helpers assume a one-sector backup area; check backup_area() before "
+	     "changing CRPL");
+
+/* Mirrors the backup layout in rpl.c: one header, then the RPL data, all in the last
+ * sector of the RPL partition.
+ */
+struct __packed backup_header {
+	uint16_t count;
+	uint32_t crc;
+};
+
+struct __packed backup_entry {
+	struct rpl_val val;
+	uint16_t src;
+	uint16_t pad;
+};
+
+#define RPL_FLASH_DEV PARTITION_DEVICE(rpl_partition)
+#define MAX_WRITE_BLOCK 16U
+
+static size_t backup_header_size(void)
+{
+	return ROUND_UP(sizeof(struct backup_header),
+			flash_get_parameters(RPL_FLASH_DEV)->write_block_size);
+}
+
+static off_t backup_area(size_t *sector_size)
+{
+	struct flash_pages_info info;
+
+	zassert_ok(flash_get_page_info_by_offs(RPL_FLASH_DEV, PARTITION_OFFSET(rpl_partition),
+					       &info));
+	*sector_size = info.size;
+
+	return PARTITION_OFFSET(rpl_partition) +
+	       (PARTITION_SIZE(rpl_partition) / info.size - 1) * info.size;
+}
+
+static struct backup_entry pack_entry(const struct bt_mesh_rpl *rpl)
+{
+	return (struct backup_entry){
+		.val.seq = rpl->seq,
+		.val.old_iv = rpl->old_iv,
+		.src = rpl->src,
+	};
+}
+
+/* The CRC that rpl.c stores for a backup of `count` entries from `list`. */
+static uint32_t backup_crc(const struct bt_mesh_rpl *list, uint16_t count)
+{
+	uint32_t crc = crc32_ieee_update(0, (const uint8_t *)&count, sizeof(count));
+
+	for (size_t i = 0; i < count; i++) {
+		struct backup_entry entry = pack_entry(&list[i]);
+
+		crc = crc32_ieee_update(crc, (const uint8_t *)&entry, sizeof(entry));
+	}
+
+	return crc;
+}
+
+/* Erases the backup area, and writes `entries` entries from `list` and the given header. */
+static void write_backup_raw(const struct bt_mesh_rpl *list, uint16_t entries,
+			     const struct backup_header *header)
+{
+	const struct flash_parameters *params = flash_get_parameters(RPL_FLASH_DEV);
+	struct backup_entry data[ROUND_UP(sizeof(struct backup_entry) * (CONFIG_BT_MESH_CRPL + 1),
+					  MAX_WRITE_BLOCK) / sizeof(struct backup_entry)];
+	uint8_t buf[MAX_WRITE_BLOCK];
+	size_t data_len = sizeof(struct backup_entry) * entries;
+	size_t sector_size;
+	off_t area = backup_area(&sector_size);
+
+	zassert_true(MAX_WRITE_BLOCK % params->write_block_size == 0);
+	zassert_true(data_len <= sizeof(data));
+
+	(void)memset(data, params->erase_value, sizeof(data));
+	for (size_t i = 0; i < entries; i++) {
+		data[i] = pack_entry(&list[i]);
+	}
+
+	(void)memset(buf, params->erase_value, sizeof(buf));
+	(void)memcpy(buf, header, sizeof(*header));
+
+	zassert_ok(flash_erase(RPL_FLASH_DEV, area, sector_size));
+	zassert_ok(flash_write(RPL_FLASH_DEV, area, buf, backup_header_size()));
+	if (data_len > 0) {
+		zassert_ok(flash_write(RPL_FLASH_DEV, area + backup_header_size(), data,
+				       ROUND_UP(data_len, params->write_block_size)));
+	}
+}
+
+/* Writes a committed backup of `count` RPL entries, with a corrupted CRC if `bad_crc`. */
+static void write_backup(const struct bt_mesh_rpl *list, uint16_t count, bool bad_crc)
+{
+	const struct backup_header header = {
+		.count = count,
+		.crc = backup_crc(list, count) ^ (bad_crc ? 1U : 0U),
+	};
+
+	write_backup_raw(list, count, &header);
+}
+
+/* An invalidated or absent backup has an erased header. */
+static bool backup_invalidated(void)
+{
+	const struct flash_parameters *params = flash_get_parameters(RPL_FLASH_DEV);
+	uint8_t buf[MAX_WRITE_BLOCK];
+	size_t sector_size;
+	off_t area = backup_area(&sector_size);
+
+	zassert_ok(flash_read(RPL_FLASH_DEV, area, buf, backup_header_size()));
+
+	for (size_t i = 0; i < sizeof(struct backup_header); i++) {
+		if (buf[i] != params->erase_value) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/* Runs `action` once on the next write into the backup area, and counts the writes into it. */
+static void hook_backup_writes(void (*action)(void))
+{
+	static const struct flash_simulator_cb cb = {
+		.write_byte = backup_write_byte,
+	};
+	size_t sector_size;
+
+	backup_hook.start = backup_area(&sector_size);
+	backup_hook.end = backup_hook.start + sector_size;
+	backup_hook.action = action;
+	atomic_set(&backup_hook.writes, 0);
+	flash_simulator_set_callbacks(RPL_FLASH_DEV, &cb);
+}
+
+/* Verifies that a committed backup holds the CONFIG_BT_MESH_CRPL entries in `list`. */
+static void verify_backup(const struct bt_mesh_rpl *list)
+{
+	struct backup_header header;
+	size_t sector_size;
+	off_t area = backup_area(&sector_size);
+
+	zassert_ok(flash_read(RPL_FLASH_DEV, area, &header, sizeof(header)));
+	zassert_equal(header.count, CONFIG_BT_MESH_CRPL);
+	zassert_equal(header.crc, backup_crc(list, CONFIG_BT_MESH_CRPL));
+
+	for (size_t i = 0; i < CONFIG_BT_MESH_CRPL; i++) {
+		struct backup_entry expected = pack_entry(&list[i]);
+		struct backup_entry entry;
+
+		zassert_ok(flash_read(RPL_FLASH_DEV, area + backup_header_size() + i * sizeof(entry),
+				      &entry, sizeof(entry)));
+		zassert_mem_equal(&entry, &expected, sizeof(entry));
+	}
+}
+
+/* The entries verify_backup_action() expects in the committed backup. */
+static const struct bt_mesh_rpl *expected_backup;
+
+static void verify_backup_action(void)
+{
+	verify_backup(expected_backup);
+}
+
+/** Verify that a reset commits a backup of the reset RPL before ZMS is cleared, keeps it
+ *  while ZMS is rewritten, and invalidates it once the rewrite is done.
+ */
+ZTEST(bt_mesh_rpl_ncs, test_reset_backs_up_until_rewritten)
+{
+	static const struct bt_mesh_rpl expected[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x1, .seq = 1, .old_iv = true },
+		{ .src = 0x2, .seq = 2, .old_iv = true },
+		{ .src = 0x3, .seq = 3, .old_iv = true },
+	};
+
+	rx_ok(0x1, 1);
+	rx_ok(0x2, 2);
+	rx_ok(0x3, 3);
+
+	expect_store_schedule_reset();
+	bt_mesh_rpl_reset();
+
+	/* The backup must be committed while ZMS is being rewritten. */
+	expected_backup = expected;
+	mid_write_action = verify_backup_action;
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	expect_pair_write(0x1, 1, true, 0x2, 2, true);
+	expect_pair_write(0x3, 3, true, 0, 0, false);
+	trigger_store();
+
+	zassert_true(backup_invalidated());
+}
+
+/** Verify that a clear does not replace a backup that is still valid, and that the backup is
+ *  kept until the clear's rewrite of ZMS is done.
+ */
+ZTEST(bt_mesh_rpl_ncs, test_clear_keeps_backup_until_rewritten)
+{
+	static const struct bt_mesh_rpl expected[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x1, .seq = 1, .old_iv = true },
+		{ .src = 0x2, .seq = 2, .old_iv = true },
+	};
+
+	rx_ok(0x1, 1);
+	rx_ok(0x2, 2);
+
+	expect_store_schedule_reset();
+	bt_mesh_rpl_reset();
+
+	/* A second reset during the rewrite leaves ZMS incomplete, so the backup is kept. */
+	mid_write_action = bt_mesh_rpl_reset;
+	expect_store_schedule_reset();
+	expect_store_schedule_reset(); /* Rescheduled at the end of the interrupted store. */
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	expect_pair_write(0x1, 1, true, 0x2, 2, true);
+	trigger_store();
+
+	verify_backup(expected);
+
+	expect_store_schedule_reset();
+	bt_mesh_rpl_clear();
+	rx_ok(0x5, 5);
+
+	/* The clear keeps the existing backup while ZMS is rewritten, and drops it after. */
+	expected_backup = expected;
+	mid_write_action = verify_backup_action;
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	expect_pair_write(0x5, 5, false, 0, 0, false);
+	trigger_store();
+
+	zassert_true(backup_invalidated());
+}
+
+static void reset_and_rx_action(void)
+{
+	expect_store_schedule_reset();
+	bt_mesh_rpl_reset();
+	rx_ok(0x5, 5);
+	expect_store_schedule_reset(); /* Rescheduled at the end of the interrupted store. */
+}
+
+/** Verify that a reset while the backup is being written stops that backup from being
+ *  committed and leaves ZMS untouched, and that the next store backs up and rewrites the
+ *  RPL from after the reset.
+ */
+ZTEST(bt_mesh_rpl_ncs, test_reset_during_backup_store_skips_commit)
+{
+	static const struct bt_mesh_rpl expected[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x5, .seq = 5 },
+	};
+
+	rx_ok(0x1, 1);
+	rx_ok(0x2, 2);
+
+	expect_store_schedule_reset();
+	bt_mesh_rpl_reset();
+
+	/* The second reset drops the old-IV entries, and 0x5 is received after it. */
+	hook_backup_writes(reset_and_rx_action);
+	trigger_store();
+
+	zassert_true(backup_invalidated());
+
+	expected_backup = expected;
+	mid_write_action = verify_backup_action;
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	expect_pair_write(0x5, 5, false, 0, 0, false);
+	trigger_store();
+
+	zassert_true(backup_invalidated());
+}
+
 ZTEST_SUITE(bt_mesh_rpl_ncs, NULL, setup, NULL, after, teardown);
 
 static void restore_after(void *f)
@@ -1543,6 +1858,246 @@ ZTEST(bt_mesh_rpl_ncs_restore, test_init_ebusy_when_provisioned)
 	zassert_equal(bt_mesh_rpl_init(), -EBUSY);
 
 	verify_rpl_entry_count(0);
+}
+
+/** Verify that a committed backup is restored into the RPL, ZMS is rewritten from it, and
+ *  the backup is invalidated afterwards.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_from_backup_rewrites_zms)
+{
+	struct bt_mesh_rpl list[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x1, .seq = 5 },
+		{ .src = 0x2, .seq = 6, .old_iv = true },
+		{ .src = 0x3, .seq = 7 },
+	};
+
+	write_backup(list, CONFIG_BT_MESH_CRPL, false);
+
+	expect_is_provisioned(false);
+	expect_zms_mount(0);
+	/* ZMS is cleared and remounted, then every pair is stored. */
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	expect_pair_write(0x1, 5, false, 0x2, 6, true);
+	expect_pair_write(0x3, 7, false, 0, 0, false);
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_true(backup_invalidated());
+
+	verify_restored_rpl_entry(0x1, 5, false);
+	verify_restored_rpl_entry(0x2, 6, true);
+	verify_restored_rpl_entry(0x3, 7, false);
+
+	verify_rpl_entry_count(3);
+}
+
+/** Verify that a backup with a bad data CRC is ignored and invalidated, and the RPL is
+ *  restored from ZMS instead.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_rejects_backup_with_bad_crc)
+{
+	struct bt_mesh_rpl list[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x9, .seq = 9 },
+	};
+
+	write_backup(list, CONFIG_BT_MESH_CRPL, true);
+
+	expect_rpl_init_setup_ok();
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_true(backup_invalidated());
+
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+
+	verify_rpl_entry_count(2);
+}
+
+/** Verify that a backup whose count is corrupted, but within the backup area, fails the CRC
+ *  and is invalidated, and the RPL is restored from ZMS instead.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_rejects_backup_with_bad_count)
+{
+	struct bt_mesh_rpl list[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x9, .seq = 9 },
+	};
+	const struct backup_header header = {
+		.count = CONFIG_BT_MESH_CRPL - 1,
+		.crc = backup_crc(list, CONFIG_BT_MESH_CRPL),
+	};
+
+	write_backup_raw(list, CONFIG_BT_MESH_CRPL, &header);
+
+	expect_rpl_init_setup_ok();
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_true(backup_invalidated());
+
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+
+	verify_rpl_entry_count(2);
+}
+
+/** Verify that a backup whose count exceeds the backup area is rejected and invalidated, and
+ *  the RPL is restored from ZMS instead.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_rejects_backup_beyond_area)
+{
+	struct bt_mesh_rpl list[CONFIG_BT_MESH_CRPL] = {
+		{ .src = 0x9, .seq = 9 },
+	};
+	const struct backup_header header = {
+		.count = UINT16_MAX - 1,
+	};
+
+	write_backup_raw(list, CONFIG_BT_MESH_CRPL, &header);
+
+	expect_rpl_init_setup_ok();
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_true(backup_invalidated());
+
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+
+	verify_rpl_entry_count(2);
+}
+
+/** Verify that an erased header means there is no backup: the RPL is restored from ZMS, and
+ *  the backup area is left untouched.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_ignores_erased_backup)
+{
+	const struct flash_parameters *params = flash_get_parameters(RPL_FLASH_DEV);
+	uint8_t marker[MAX_WRITE_BLOCK];
+	uint8_t buf[MAX_WRITE_BLOCK];
+	size_t sector_size;
+	off_t area = backup_area(&sector_size);
+
+	/* A marker after the erased header shows whether the area was erased again. */
+	(void)memset(marker, (uint8_t)~params->erase_value, sizeof(marker));
+	zassert_ok(flash_erase(RPL_FLASH_DEV, area, sector_size));
+	zassert_ok(flash_write(RPL_FLASH_DEV, area + backup_header_size(), marker,
+			       sizeof(marker)));
+
+	/* Without explicit erase, an invalidation only writes the header, so count writes too. */
+	hook_backup_writes(NULL);
+
+	expect_rpl_init_setup_ok();
+	expect_zms_iter_next_entry(0x1, 1, false, 0x2, 2, true);
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_equal(atomic_get(&backup_hook.writes), 0, "The backup area was written");
+	zassert_true(backup_invalidated());
+	zassert_ok(flash_read(RPL_FLASH_DEV, area + backup_header_size(), buf, sizeof(buf)));
+	zassert_mem_equal(buf, marker, sizeof(marker));
+
+	verify_restored_rpl_entry(0x1, 1, false);
+	verify_restored_rpl_entry(0x2, 2, true);
+
+	verify_rpl_entry_count(2);
+}
+
+/** Verify that a backup holding more entries than CRPL restores the entries that fit, and
+ *  is invalidated afterwards.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_backup_with_too_many_entries)
+{
+	struct bt_mesh_rpl list[CONFIG_BT_MESH_CRPL + 1];
+
+	zassert_true(CONFIG_BT_MESH_CRPL % 2 == 0, "CRPL must be even for this test");
+
+	for (int i = 0; i < ARRAY_SIZE(list); i++) {
+		list[i] = (struct bt_mesh_rpl){ .src = 0x100 + i, .seq = 10 + i };
+	}
+
+	write_backup(list, ARRAY_SIZE(list), false);
+
+	expect_is_provisioned(false);
+	expect_zms_mount(0);
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	/* The last entry doesn't fit, so it is dropped. */
+	for (int i = 0; i < CONFIG_BT_MESH_CRPL; i += 2) {
+		expect_pair_write(list[i].src, list[i].seq, false,
+				  list[i + 1].src, list[i + 1].seq, false);
+	}
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_true(backup_invalidated());
+
+	for (int i = 0; i < CONFIG_BT_MESH_CRPL; i++) {
+		verify_restored_rpl_entry(list[i].src, list[i].seq, false);
+	}
+
+	verify_rpl_entry_count(CONFIG_BT_MESH_CRPL);
+}
+
+/** Verify that a backup holding fewer entries than CRPL restores all of them. */
+ZTEST(bt_mesh_rpl_ncs_restore, test_restore_backup_with_fewer_entries)
+{
+	struct bt_mesh_rpl list[2] = {
+		{ .src = 0x1, .seq = 5 },
+		{ .src = 0x2, .seq = 6, .old_iv = true },
+	};
+
+	write_backup(list, ARRAY_SIZE(list), false);
+
+	expect_is_provisioned(false);
+	expect_zms_mount(0);
+	expect_zms_clear(0);
+	expect_zms_mount(0);
+	expect_pair_write(0x1, 5, false, 0x2, 6, true);
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	zassert_true(backup_invalidated());
+
+	verify_restored_rpl_entry(0x1, 5, false);
+	verify_restored_rpl_entry(0x2, 6, true);
+
+	verify_rpl_entry_count(2);
+}
+
+/** Verify that the sectors of the RPL partition are split between ZMS and the backup area
+ *  without a gap or overlap: ZMS gets every sector before the backup area, and the backup
+ *  area ends at the end of the partition.
+ */
+ZTEST(bt_mesh_rpl_ncs_restore, test_init_splits_partition_between_zms_and_backup)
+{
+	const struct zms_fs *fs;
+	size_t sector_size;
+	off_t backup_start = backup_area(&sector_size);
+
+	expect_rpl_init_setup_ok();
+	expect_zms_iter_next_end();
+
+	zassert_ok(bt_mesh_rpl_init());
+
+	fs = global_mock_data.zms_fs;
+	zassert_not_null(fs);
+
+	zassert_equal(fs->offset, PARTITION_OFFSET(rpl_partition));
+	zassert_equal(fs->sector_size, sector_size);
+	zassert_equal(fs->offset + (off_t)fs->sector_count * fs->sector_size, backup_start,
+		      "ZMS does not end where the backup area starts");
+	zassert_equal(backup_start + sector_size,
+		      PARTITION_OFFSET(rpl_partition) + PARTITION_SIZE(rpl_partition),
+		      "The backup area does not end where the partition ends");
 }
 
 ZTEST_SUITE(bt_mesh_rpl_ncs_restore, NULL, NULL, NULL, restore_after, NULL);
